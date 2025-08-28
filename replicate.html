@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>PouchDB Replication (with timing + attachment preview)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/pouchdb@9.0.0/dist/pouchdb.min.js"></script>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;line-height:1.35;margin:12px;background:#fafafa}
+    h1{font-size:18px;margin:6px 0 12px}
+    label{display:block;margin:8px 0 4px}
+    input,select,button{font-size:16px;padding:8px 10px;border:1px solid #ccc;border-radius:6px}
+    input,select{width:100%;box-sizing:border-box}
+    button{background:#0b6efd;color:#fff;border-color:#0b6efd;cursor:pointer}
+    button:disabled{opacity:.6;cursor:not-allowed}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+    .stack{display:grid;gap:10px}
+    #out{white-space:pre-wrap;background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px;margin-top:10px}
+    #log{white-space:pre-wrap;background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px;margin-top:10px;height:160px;overflow:auto}
+    #preview{margin-top:12px;background:#fff;border:1px solid #ddd;border-radius:8px;padding:10px}
+    img,video{max-width:100%;height:auto}
+    .ok{color:#0a7c2f} .warn{color:#a86b00} .err{color:#b00020}
+    .inline{display:flex;gap:10px}
+  </style>
+</head>
+<body>
+  <h1>PouchDB Replication (with timing)</h1>
+
+  <div class="stack">
+    <label>Remote CouchDB URL (DB path included)
+      <input id="remote" value="http://admin:pass@192.168.86.250:5984/media" />
+    </label>
+
+    <div class="row">
+      <label>Local DB name
+        <input id="local" value="media" />
+      </label>
+      <label>Retry
+        <select id="retry">
+          <option value="true" selected>true</option>
+          <option value="false">false</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="row">
+      <label>batch_size
+        <input id="batch_size" type="number" min="1" value="100" />
+      </label>
+      <label>batches_limit
+        <input id="batches_limit" type="number" min="1" value="10" />
+      </label>
+    </div>
+
+    <label>doc_ids (optional, comma-separated)
+      <input id="doc_ids" placeholder="e.g. bigvid-1,bigvid-2" />
+    </label>
+
+    <div class="row">
+      <button id="start">Start pull</button>
+      <button id="cancel" disabled>Cancel</button>
+    </div>
+
+    <div class="row">
+      <button id="clear">Clear log</button>
+    </div>
+
+    <div class="row">
+      <div>
+        <label>Local docs
+          <select id="docList"></select>
+        </label>
+      </div>
+      <div class="inline" style="align-items:end">
+        <div style="flex:1">
+          <label>Attachments in selected doc
+            <select id="attList"></select>
+          </label>
+        </div>
+        <button id="previewBtn" style="height:42px">Preview</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="out">Ready.</div>
+  <div id="log"></div>
+  <div id="preview"></div>
+
+<script>
+(function(){
+  const $ = id => document.getElementById(id);
+  const out = $('out'), log = $('log'), preview = $('preview');
+
+  const state = { db:null, cancelFn:null };
+
+  function setOut(msg, cls=''){ out.className=cls; out.textContent=msg; }
+  function addLog(...a){ log.textContent += a.join(' ') + '\n'; log.scrollTop = log.scrollHeight; }
+  function clearLog(){ log.textContent=''; }
+  function mb(bytes){ return (bytes/1024/1024).toFixed(1)+' MB'; }
+
+  async function ensureDB(){
+    if (state.db) return state.db;
+    state.db = new PouchDB(($('local').value||'media').trim());
+    return state.db;
+  }
+
+  async function refreshDocPicker(){
+    const db = await ensureDB();
+    const all = await db.allDocs({include_docs:true, attachments:true});
+    const sel = $('docList');
+    sel.innerHTML = '';
+    if (!all.rows.length){
+      sel.innerHTML = '<option value="">(no docs)</option>';
+      $('attList').innerHTML = '<option value="">(no attachments)</option>';
+      return;
+    }
+    for (const row of all.rows){
+      const opt = document.createElement('option');
+      opt.value = row.id;
+      const attCount = row.doc && row.doc._attachments ? Object.keys(row.doc._attachments).length : 0;
+      opt.textContent = `${row.id} (${attCount} att)`;
+      sel.appendChild(opt);
+    }
+    populateAttPicker(); // populate for first doc
+  }
+
+  async function populateAttPicker(){
+    const db = await ensureDB();
+    const sel = $('docList');
+    const attSel = $('attList');
+    attSel.innerHTML = '';
+    const id = sel.value;
+    if (!id){ attSel.innerHTML = '<option value="">(no attachments)</option>'; return; }
+    try{
+      const doc = await db.get(id, {attachments:true});
+      const names = Object.keys(doc._attachments||{});
+      if (!names.length){
+        attSel.innerHTML = '<option value="">(no attachments)</option>';
+        return;
+      }
+      for (const name of names){
+        const a = doc._attachments[name];
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = `${name} — ${a.content_type||'?'}, ${a.length?mb(a.length):''}`;
+        attSel.appendChild(opt);
+      }
+    } catch(e){
+      addLog('⚠️ could not read doc for attachments:', e.name, e.message);
+      attSel.innerHTML = '<option value="">(error)</option>';
+    }
+  }
+
+  $('docList').addEventListener('change', populateAttPicker);
+
+  $('previewBtn').addEventListener('click', async ()=>{
+    const id = $('docList').value;
+    const name = $('attList').value;
+    if (!id || !name) return;
+    const db = await ensureDB();
+    try{
+      const t0 = performance.now();
+      const blob = await db.getAttachment(id, name);
+      const t1 = performance.now();
+      setOut(`📦 Previewed "${name}" from "${id}" in ${(t1-t0).toFixed(0)} ms (${blob.type||'blob'}, ${mb(blob.size||0)})`, 'ok');
+      const url = URL.createObjectURL(blob);
+      if (blob.type.startsWith('image/')) preview.innerHTML = `<img src="${url}" alt="${name}">`;
+      else if (blob.type.startsWith('video/')) preview.innerHTML = `<video controls src="${url}" playsinline></video>`;
+      else preview.innerHTML = `<a href="${url}" download="${name}">⬇ Download ${name}</a>`;
+    }catch(e){
+      setOut(`❌ Preview error: ${e.name} – ${e.message}`, 'err');
+      addLog(e.stack||e);
+    }
+  });
+
+  $('clear').addEventListener('click', ()=>{
+    clearLog(); setOut('Cleared.'); preview.innerHTML='';
+  });
+
+  $('start').addEventListener('click', async ()=>{
+    clearLog(); preview.innerHTML='';
+    const remote = $('remote').value.trim();
+    if (!remote){ setOut('Please enter a CouchDB URL with DB path', 'warn'); return; }
+    const db = await ensureDB();
+
+    const opts = {
+      batch_size: +$('batch_size').value || 100,
+      batches_limit: +$('batches_limit').value || 10,
+      retry: $('retry').value === 'true'
+    };
+
+    // Optional doc_ids filter
+    const ids = $('doc_ids').value.trim();
+    if (ids) opts.doc_ids = ids.split(',').map(s=>s.trim()).filter(Boolean);
+
+    setOut('⏳ Starting pull…'); addLog('pull opts:', JSON.stringify(opts));
+
+    const t0 = performance.now();
+    const rep = db.replicate.from(remote, opts);
+
+    $('start').disabled = true;
+    $('cancel').disabled = false;
+
+    state.cancelFn = ()=>{ try{ rep.cancel(); }catch{} };
+
+    rep.on('change', info=>{
+      addLog('change:', JSON.stringify({
+        last_seq: info.last_seq,
+        docs: (info.docs||[]).length
+      }));
+    });
+
+    rep.on('paused', err=>{
+      if (err){ addLog('paused with err:', err.name, err.message); }
+      else { addLog('paused (idle)'); }
+    });
+
+    rep.on('active', ()=> addLog('active'));
+
+    rep.on('denied', err=> addLog('denied:', err.name, err.message));
+
+    rep.on('complete', async info=>{
+      const elapsed = performance.now()-t0;
+      const summary = {
+        elapsed_ms: Math.round(elapsed),
+        changes: info.changes,
+        docs_read: info.docs_read,
+        docs_written: info.docs_written
+      };
+      setOut(`✅ Complete in ${summary.elapsed_ms} ms — changes=${summary.changes}, docs_read=${summary.docs_read}, docs_written=${summary.docs_written}`, 'ok');
+      addLog('complete:', JSON.stringify(summary, null, 2));
+      $('start').disabled = false;
+      $('cancel').disabled = true;
+      state.cancelFn = null;
+      try{ await refreshDocPicker(); }catch{}
+    });
+
+    rep.on('error', err=>{
+      setOut(`❌ Replication error: ${err.name} – ${err.message}`, 'err');
+      addLog(err.stack||err);
+      $('start').disabled = false;
+      $('cancel').disabled = true;
+      state.cancelFn = null;
+    });
+  });
+
+  $('cancel').addEventListener('click', ()=>{
+    if (state.cancelFn) state.cancelFn();
+  });
+
+  // First run: create/open DB and populate pickers (no crash if empty)
+  (async ()=>{ await ensureDB(); await refreshDocPicker(); setOut('Ready.'); })();
+
+  // Global error tracing
+  window.addEventListener('unhandledrejection', e=> addLog('unhandledrejection:', e.reason?.name, e.reason?.message));
+  window.addEventListener('error', e=> addLog('window error:', e.message));
+})();
+</script>
+</body>
+</html>
